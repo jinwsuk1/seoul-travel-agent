@@ -1,0 +1,11 @@
+# 데이터 처리 및 API 통신
+pandas
+requests
+python-dotenv
+
+# 벡터 DB 및 임베딩
+qdrant-client
+sentence-transformers
+
+# AI 모델 (Gemini)
+google-genai
