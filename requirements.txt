@@ -1,11 +1,11 @@
-# 데이터 처리 및 API 통신
-pandas
-requests
-python-dotenv
-
-# 벡터 DB 및 임베딩
-qdrant-client
-sentence-transformers
-
-# AI 모델 (Gemini)
-google-genai
+pandas==2.2.2
+qdrant-client==1.8.2
+sentence-transformers==2.7.0
+langchain==0.1.16
+langchain-community==0.0.34
+langchain-core==0.1.45
+requests==2.31.0
+python-dotenv==1.0.1
+matplotlib==3.8.4
+seaborn==0.13.2
+networkx==3.3
