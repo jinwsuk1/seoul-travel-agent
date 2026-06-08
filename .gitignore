@@ -1,7 +1,8 @@
 # 가상환경 (팀원마다 경로가 다를 수 있음)
 venv/
 env/
-
+.venv
+multimodal_images
 # 보안 (Gemini API 키 등)
 .env
 
