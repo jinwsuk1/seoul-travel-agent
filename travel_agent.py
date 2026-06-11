@@ -1,64 +1,361 @@
 import os
-from google import genai
+import re
+import json
+import urllib.parse
+import requests
+import pandas as pd
+import networkx as nx
 from dotenv import load_dotenv
 from qdrant_client import QdrantClient
+from qdrant_client.http import models  # 💡 DB 필터 검색을 위해 추가됨
 from sentence_transformers import SentenceTransformer
+from langchain_community.chat_models import ChatOllama
+from langchain_core.messages import HumanMessage
 
-load_dotenv()
+# =====================================================================
+# 1. 초기 세팅 (로컬 모델, DB, 환경 변수)
+# =====================================================================
+print("⏳ 시스템을 초기화하는 중입니다. 잠시만 기다려주세요...")
 
-api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    print("⚠️ 에러: .env 파일에 API 키가 설정되지 않았습니다.")
+# .env 파일에서 환경변수를 불러옵니다.
+load_dotenv() 
 
-client_gemini = genai.Client(api_key=api_key)
-
-qdrant = QdrantClient(path="./qdrant_local_db")
+# 벡터 검색 엔진 및 로컬 오픈소스 LLM 세팅
 embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+qdrant = QdrantClient(path="./qdrant_local_db")
+local_llm = ChatOllama(model="qwen2.5:3b", temperature=0)
 
-def ask_agent(query):
-    query_vector = embed_model.encode(query).tolist()
+# =====================================================================
+# 🧠 2. 지식 그래프(Knowledge Graph) 메모리 구축
+# =====================================================================
+print("🧠 3만 6천 건의 데이터를 기반으로 지식 그래프(KG) 온톨로지를 빌드하는 중...")
+kg_df = pd.read_csv("refined_seoul_spots.csv", low_memory=False)
 
+def get_gu_name(address):
     try:
-        response = qdrant.query_points(collection_name="seoul_spots", query=query_vector, limit=3)
-        search_results = response.points
-    except Exception:
-        search_results = qdrant.search(collection_name="seoul_spots", query_vector=query_vector, limit=3)
+        parts = str(address).split()
+        for p in parts:
+            if p.endswith('구') and len(p) < 5: 
+                return p
+        return '기타'
+    except Exception: 
+        return '기타'
 
-    if not search_results:
-        return "죄송합니다. DB에서 관련 맛집 정보를 찾을 수 없습니다."
+kg_df['지역구'] = kg_df['도로명주소'].apply(get_gu_name)
+
+# NetworkX 방향성 멀티 그래프 생성
+G = nx.MultiDiGraph()
+for row in kg_df.itertuples(index=False):
+    row_dict = row._asdict()
+    restaurant = row_dict['사업장명']
+    district = row_dict['지역구']
+    category = row_dict['업태구분명']
+    
+    # 온톨로지 규칙: 식당은 지역구에 '위치하고(LOCATED_IN)', 특정 업종으로 '분류됨(IS_A)'
+    G.add_edge(restaurant, district, relation='LOCATED_IN')
+    G.add_edge(restaurant, category, relation='IS_A')
+
+print(f"   ✅ 지식 그래프 구축 완료! (총 노드 수: {G.number_of_nodes():,}개)")
+
+
+# =====================================================================
+# 🕵️ [에이전트 1: 의도 분석 에이전트 (Router)]
+# =====================================================================
+def router_agent(query):
+    print("\n🕵️ [의도 분석 에이전트] 질문에서 지역과 키워드를 추출 중...")
+    prompt = f"""
+    당신은 사용자의 질문에서 검색 조건을 추출하는 분석기입니다.
+    질문에서 '지역(구 이름)'과 '음식 종류(키워드)'를 찾아 아래의 엄격한 JSON 형식으로만 답변하세요. 다른 설명은 절대 추가하지 마세요.
+    (예시: {{"region": "강남구", "keyword": "커피"}})
+    지역이 언급되지 않았다면 region을 빈 문자열("")로 두세요.
+
+    질문: {query}
+    """
+    response = local_llm.invoke([HumanMessage(content=prompt)])
+    
+    try:
+        text = response.content.strip()
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+            
+        parsed = json.loads(text)
+        region = parsed.get("region", "")
+        keyword = parsed.get("keyword", query)
+        print(f"   ✅ 분석 결과 -> 지역: '{region}', 키워드: '{keyword}'")
+        return region, keyword
+    except Exception:
+        print("   ⚠️ 분석 실패. 기본 검색으로 진행합니다.")
+        return "", query
+
+# =====================================================================
+# 🔍 [에이전트 2: 검색 에이전트 (Retriever)]
+# =====================================================================
+def retriever_agent(region, keyword):
+    print("🔍 [검색 에이전트] 벡터 DB에서 관련 식당을 찾는 중...")
+    
+    if not keyword or keyword.strip() == "": 
+        keyword = "맛집"
         
-    information = "\n".join([hit.payload.get('context', '') for hit in search_results])
+    query_vector = embed_model.encode(keyword).tolist()
+    
+    try:
+        try:
+            points = qdrant.query_points(collection_name="seoul_spots", query=query_vector, limit=500).points
+        except Exception:
+            points = qdrant.search(collection_name="seoul_spots", query_vector=query_vector, limit=500)
+
+        # 안전한 지역구 필터링
+        filtered_points = []
+        for pt in points:
+            safe_address = str(pt.payload.get("address", ""))
+            if region and "구" in region:
+                if region in safe_address: 
+                    filtered_points.append(pt)
+            else:
+                filtered_points.append(pt)
+                
+        final_results = filtered_points[:3]
+        print(f"   ✅ 필터링 완료: {len(final_results)}개의 유효한 데이터를 찾아왔습니다.")
+        return final_results
+        
+    except Exception as e:
+        print(f"   ⚠️ 검색 오류 발생: {e}")
+        return []
+
+# =====================================================================
+# 🕸️ [도구 1: 지식 그래프 추론 도구 (KG Traversal Tool)]
+# =====================================================================
+def kg_search_tool(restaurant_name):
+    print(f"   🕸️ [지식 그래프 도구] '{restaurant_name}'의 온톨로지 관계망 추적 중...")
+    try:
+        if restaurant_name not in G:
+            return "연관 대안 매장 정보 없음"
+            
+        district = None
+        category = None
+        
+        for neighbor in G.successors(restaurant_name):
+            edge_data = G[restaurant_name][neighbor]
+            for key in edge_data:
+                rel = edge_data[key].get('relation')
+                if rel == 'LOCATED_IN': district = neighbor
+                if rel == 'IS_A': category = neighbor
+                
+        if not district or not category: 
+            return "연관 데이터 부족"
+
+        alternatives = []
+        for r in G.predecessors(district):
+            if r != restaurant_name and G.has_edge(r, category):
+                alternatives.append(r)
+                if len(alternatives) >= 2: 
+                    break 
+                
+        if alternatives:
+            return f"같은 [{district}] 내 동일한 [{category}] 업종 대안 매장: " + ", ".join(alternatives)
+        return f"주변 상권 내 동일 업종 대안 매장 없음"
+    except Exception as e:
+        return "관계망 분석 불가"
+
+# =====================================================================
+# 🖼️ [도구 2: 이미지 도구 (Qdrant DB 다이렉트 검색)]
+# =====================================================================
+def local_multimodal_tool(restaurant_name):
+    print(f"   🖼️ [이미지 도구] Qdrant DB 'seoul_images' 컬렉션에서 '{restaurant_name}' 이미지 검색 중...")
+    
+    image_url = ""
+    
+    try:
+        records, _ = qdrant.scroll(
+            collection_name="seoul_images",
+            scroll_filter=models.Filter(
+                must=[models.FieldCondition(
+                    key="name",
+                    match=models.MatchValue(value=restaurant_name)
+                )]
+            ),
+            limit=1
+        )
+        
+        if records:
+            image_url = str(records[0].payload.get("image_path")).replace("\\", "/")
+        else:
+            encoded_name = urllib.parse.quote(restaurant_name)
+            image_url = f"https://dummyimage.com/400x300/cccccc/000000.png&text={encoded_name}"
+            
+    except Exception as e:
+        print(f"   ⚠️ DB 이미지 검색 실패: {e}")
+        encoded_name = urllib.parse.quote(restaurant_name)
+        image_url = f"https://dummyimage.com/400x300/cccccc/000000.png&text={encoded_name}"
+
+    return image_url
+
+# =====================================================================
+# 🗺️ [도구 3: 카카오 로컬 API 도구]
+# =====================================================================
+def kakao_search_tool(restaurant_name, region):
+    print(f"   🗺️ [카카오 API 도구] '{restaurant_name}' 실시간 장소 검색 중...")
+    kakao_key = os.getenv("KAKAO_API_KEY", "")
+    fallback_url = f"https://map.kakao.com/link/search/{urllib.parse.quote(f'{region} {restaurant_name}'.strip())}"
+    
+    if not kakao_key:
+        return {"place_url": fallback_url, "address": "", "phone": "", "category": ""}
+    
+    try:
+        headers = {"Authorization": f"KakaoAK {kakao_key}"}
+        params = {"query": f"{region} {restaurant_name}".strip(), "size": 1}
+        res = requests.get(
+            "https://dapi.kakao.com/v2/local/search/keyword.json",
+            headers=headers, params=params, timeout=5
+        )
+        res.raise_for_status()
+        docs = res.json().get("documents", [])
+        if docs:
+            doc = docs[0]
+            print(f"   ✅ 카카오 검색 성공: {doc.get('place_name', '')}")
+            return {
+                "place_url": doc.get("place_url", fallback_url),
+                "address": doc.get("road_address_name") or doc.get("address_name", ""),
+                "phone": doc.get("phone", ""),
+                "category": doc.get("category_name", ""),
+            }
+    except Exception as e:
+        print(f"   ⚠️ 카카오 API 오류 (fallback 사용): {e}")
+    
+    return {"place_url": fallback_url, "address": "", "phone": "", "category": ""}
+
+# =====================================================================
+# 📰 [도구 4: 네이버 지역 검색 API 도구]
+# =====================================================================
+def naver_review_tool(restaurant_name, region):
+    print(f"   📰 [네이버 API 도구] '{restaurant_name}' 네이버 지역 정보 검색 중...")
+    client_id = os.getenv("NAVER_CLIENT_ID", "")
+    client_secret = os.getenv("NAVER_CLIENT_SECRET", "")
+    
+    if not client_id or not client_secret:
+        return {"naver_url": "", "description": "", "address": ""}
+    
+    try:
+        headers = {
+            "X-Naver-Client-Id": client_id,
+            "X-Naver-Client-Secret": client_secret,
+        }
+        params = {"query": f"{region} {restaurant_name}".strip(), "display": 1, "sort": "comment"}
+        res = requests.get(
+            "https://openapi.naver.com/v1/search/local.json",
+            headers=headers, params=params, timeout=5
+        )
+        res.raise_for_status()
+        items = res.json().get("items", [])
+        if items:
+            item = items[0]
+            title = re.sub('<[^<]+?>', '', item.get("title", ""))
+            print(f"   ✅ 네이버 검색 성공: {title}")
+            return {
+                "naver_url": item.get("link", ""),
+                "description": item.get("description", ""),
+                "address": item.get("roadAddress") or item.get("address", ""),
+            }
+    except Exception as e:
+        print(f"   ⚠️ 네이버 API 오류: {e}")
+    
+    return {"naver_url": "", "description": "", "address": ""}
+
+# =====================================================================
+# ✍️ [에이전트 3: 답변 생성 에이전트 (Generator)] - GraphRAG 융합
+# =====================================================================
+def generator_agent(query, search_results, region):
+    print("✍️ [답변 생성 에이전트] 벡터, 지식 그래프, 미디어 데이터를 융합 중...")
+    
+    if not search_results:
+        return "조건에 맞는 맛집 정보를 DB에서 찾을 수 없습니다."
+
+    enriched_information = []
+    for idx, hit in enumerate(search_results, 1):
+        name = hit.payload.get('name', '이름 모를 식당')
+        context = hit.payload.get('context', '')
+        
+        # 4개 도구 병렬 실행
+        image_url    = local_multimodal_tool(name)
+        kg_inference = kg_search_tool(name)
+        kakao_info   = kakao_search_tool(name, region)
+        naver_info   = naver_review_tool(name, region)
+        
+        enriched_information.append(
+            f"[{idx}번 식당]\n"
+            f"- 상호명: {name}\n"
+            f"- 핵심 정보: {context}\n"
+            f"- 사진 URL: {image_url}\n"
+            f"- 카카오맵 URL: {kakao_info['place_url']}\n"
+            f"- 카카오 주소: {kakao_info['address']}\n"
+            f"- 전화번호: {kakao_info['phone']}\n"
+            f"- 네이버 지도 URL: {naver_info['naver_url']}\n"
+            f"- 네이버 설명: {naver_info['description']}\n"
+            f"- 대안 매장 정보: {kg_inference}\n"
+        )
+
+    final_context = "\n".join(enriched_information)
 
     prompt = f"""
-    너는 서울 맛집 전문가야. 아래 제공된 정보를 바탕으로 사용자의 질문에 친절하게 답변해줘.
+    당신은 제공된 [참고 정보]만을 바탕으로 답변을 작성하는 시스템입니다.
+    검색된 식당을 절대로 하나로 합치지 말고, 각각 독립적으로 소개하세요.
+
+    [작성 규칙 - 매우 중요]
+    1. 검색된 모든 식당을 하나씩 아래 [출력 템플릿]에 맞춰 작성하세요.
+    2. '전화번호'가 있으면 반드시 포함하세요. 없으면 해당 줄을 생략하세요.
+    3. '네이버 설명'이 있으면 간략히 요약해서 포함하세요.
+    4. '대안 매장 정보'가 있다면 템플릿의 대안 매장 부분에 적고, 없다면 해당 줄을 생략하세요.
+    5. 템플릿 외의 불필요한 인사말, 중복된 요약, 맺음말은 절대 쓰지 마세요.
+
+    [출력 템플릿]
+    ### 🍽️ [상호명]
+    - **주소**: [카카오 주소]
+    - **전화번호**: [전화번호]
+    - **위치 및 특징**: [핵심 정보 + 네이버 설명 요약]
+    - **💡 GraphRAG 추천**: 만약 자리가 없다면, [대안 매장 이름]을(를) 방문해 보세요!
+
+    ![식당 사진]([사진 URL을 1글자도 바꾸지 말고 그대로 복사])
+    * 🗺️ [카카오맵 바로가기]([카카오맵 URL])
+    * 🔍 [네이버 지도 바로가기]([네이버 지도 URL])
     
+    ---
+
     [참고 정보]
-    {information}
-    
+    {final_context}
+
     [질문]
     {query}
     """
-    
-    response = client_gemini.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt
-    )
-    return response.text
+    response = local_llm.invoke([HumanMessage(content=prompt)])
+    return response.content
+
+# =====================================================================
+# ⚙️ [메인 오케스트레이션]
+# =====================================================================
+def run_agentic_rag(query):
+    region, keyword = router_agent(query)
+    results = retriever_agent(region, keyword)
+    final_answer = generator_agent(query, results, region)
+    return final_answer
 
 if __name__ == "__main__":
-    print("🚀 서울 맛집 Gemini 에이전트 준비 완료!")
+    print("\n🚀 [GraphRAG & 로컬 멀티모달] 초고속 에이전트 구동!")
     print("💡 (종료하려면 '종료', 'exit', 'q' 중 하나를 입력하세요.)\n")
     
     while True:
         user_input = input("어떤 곳을 찾으시나요? : ")
         
         if user_input.lower() in ['종료', 'exit', 'q', 'quit']:
-            print("👋 AI 에이전트를 종료합니다. 수고하셨습니다!")
+            print("👋 시스템을 종료합니다.")
             break
             
-        if not user_input.strip():
+        if not user_input.strip(): 
             continue
-            
-        print("\n[AI 답변]:")
-        print(ask_agent(user_input))
-        print("\n" + "="*50 + "\n")
+        
+        print("\n" + "-"*50)
+        answer = run_agentic_rag(user_input)
+        print("-" * 50)
+        print("[최종 AI 답변 (GraphRAG)]:\n\n", answer)
+        print("=" * 50 + "\n")
