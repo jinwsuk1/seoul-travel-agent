@@ -9,3 +9,6 @@ sentence-transformers
 
 # AI 모델 (Gemini)
 google-genai
+
+# 이미지 처리
+Pillow
