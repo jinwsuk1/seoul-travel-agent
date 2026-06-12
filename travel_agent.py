@@ -143,10 +143,20 @@ def retriever_agent(region, keyword):
         except Exception:
             points = qdrant.search(collection_name="seoul_spots", query_vector=query_vector, limit=500)
 
-        # 안전한 지역구 필터링
+        # 안전한 지역구 및 편의점 필터링
         filtered_points = []
+        con_keywords = ["편의점", "cu", "gs25", "세븐일레븐", "이마트24", "미니스톱", "씨유", "지에스"]
+        exclude_convenience = not any(ck in keyword.lower() for ck in con_keywords)
+        
         for pt in points:
+            name = str(pt.payload.get("name", ""))
             safe_address = str(pt.payload.get("address", ""))
+            
+            if exclude_convenience:
+                is_convenience = any(ck in name.lower() for ck in ["cu", "gs25", "세븐일레븐", "이마트24", "미니스톱"])
+                if is_convenience:
+                    continue
+                    
             if region and "구" in region:
                 if region in safe_address: 
                     filtered_points.append(pt)
@@ -276,6 +286,10 @@ def naver_image_search(restaurant_name, region):
         "yonhapnews.co.kr", "etnews.com", "press", "media"
     ]
     
+    # 대표 사진을 골라내기 위한 키워드 정의
+    BAD_KEYWORDS = ["지도", "map", "위치", "주차", "약도", "영업시간", "주차장", "메뉴판", "가격표", "원산지", "배달", "포장", "이벤트", "가는법", "오는길"]
+    GOOD_KEYWORDS = ["대표", "외관", "간판", "음식", "실내", "인테리어", "후기", "추천", "메인", "시그니처", "디저트", "플레이팅"]
+    
     try:
         headers = {
             "X-Naver-Client-Id": client_id,
@@ -291,29 +305,66 @@ def naver_image_search(restaurant_name, region):
         res.raise_for_status()
         items = res.json().get("items", [])
         
-        # 1. 1차 필터링: 뉴스/방송사 도메인을 포함하지 않고, 개인 리뷰(블로그/포스트/카페)로 유력한 도메인 우선 탐색
+        scored_items = []
         for item in items:
             link = item.get("link", "")
+            title = item.get("title", "")
             if not link:
                 continue
                 
-            # 블랙리스트 도메인 체크
+            # 1. 뉴스/방송 매체 도메인 차단
             is_news = any(domain in link for domain in NEWS_DOMAINS)
             if is_news:
                 continue
                 
-            # 블로그 및 소셜 리뷰 미디어(tistory, naver blog 등) 우선 선택
+            score = 0
+            
+            # 2. 블로그/소셜 리뷰 우선순위 부여 (+20점)
             if any(ref in link for ref in ["blog", "post", "tistory", "daum", "egloos", "instagram", "facebook"]):
-                return link
+                score += 20
                 
-        # 2. 2차 필터링: 만개한 블로그는 아니지만 그래도 뉴스 도메인이 아닌 일반 이미지 탐색
-        for item in items:
-            link = item.get("link", "")
-            if not link:
-                continue
-            is_news = any(domain in link for domain in NEWS_DOMAINS)
-            if not is_news:
-                return link
+            # 3. 부정적 키워드 필터링 (지도, 약도, 주차 등 -30점)
+            for bad_kw in BAD_KEYWORDS:
+                if bad_kw in title or bad_kw in link:
+                    score -= 30
+                    break
+                    
+            # 4. 긍정적 키워드 가점 부여 (+10점)
+            for good_kw in GOOD_KEYWORDS:
+                if good_kw in title:
+                    score += 10
+            
+            # 상호명이 타이틀에 포함된 경우 신뢰도 업 (+10점)
+            if clean_name in title:
+                score += 10
+                
+            # 5. 종횡비 가로 규격 가점 (aspect ratio = width / height)
+            try:
+                width = int(item.get("sizewidth", 0))
+                height = int(item.get("sizeheight", 0))
+                if width > 200 and height > 200:
+                    ratio = width / height
+                    # 가로형 음식 사진 황금 비율 (1.1 ~ 1.7)
+                    if 1.1 <= ratio <= 1.7:
+                        score += 5
+                    # 극단적인 비율(세로 배너 등) 벌점
+                    elif ratio < 0.5 or ratio > 2.0:
+                        score -= 15
+                else:
+                    score -= 10
+            except Exception:
+                pass
+                
+            scored_items.append((score, link))
+            
+        if scored_items:
+            # 점수가 높은 순으로 정렬
+            scored_items.sort(key=lambda x: x[0], reverse=True)
+            best_score, best_link = scored_items[0]
+            # 최고 점수가 최소 기준(-20점) 이상인 경우 반환
+            if best_score >= -20:
+                print(f"      🎯 [이미지 매칭 알고리즘] 최적 대표 이미지 선정 성공 (점수: {best_score}): {best_link}")
+                return best_link
                 
     except Exception as e:
         print(f"   ⚠️ 네이버 이미지 검색 API 오류: {e}")
